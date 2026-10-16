@@ -1,0 +1,12 @@
+{
+  "name": "iguana-resource-system",
+  "private": true,
+  "description": "Punto de entrada para plataformas de despliegue (Railway): delega en el servicio ./caracterizacion",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "npm ci --include=dev --prefix caracterizacion && npm run build --prefix caracterizacion",
+    "start": "npm start --prefix caracterizacion"
+  }
+}
