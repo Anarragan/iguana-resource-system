@@ -2,7 +2,7 @@
 
 La API **solo recolecta**. Los voluntarios envían las respuestas de **una ficha por hogar**, paso a paso, y la API devuelve únicamente **avance, qué falta y alertas calculadas**. **No existe ningún endpoint que devuelva nombres, direcciones, teléfonos ni las respuestas de una familia**: eso se consulta en la base de datos, con las vistas de coordinación (§6).
 
-JSON en `camelCase`. Toda petición lleva la cabecera `x-api-key` (excepto `GET /salud`). Las opciones de las listas **nunca se escriben a mano en el front**: salen de `GET /catalogos`.
+JSON en `camelCase`. Toda petición lleva `Authorization: Bearer <token>` con el token de sesión de Supabase Auth del voluntario (un administrador lo invita por correo desde Supabase y él crea su contraseña) (excepto `GET /salud`). Cómo obtenerlo y cómo configurar el front: [front-guia.md](front-guia.md). Versión máquina-legible: [openapi.yaml](openapi.yaml). Las opciones de las listas **nunca se escriben a mano en el front**: salen de `GET /catalogos`.
 
 ## 1. Qué NO se le pide a quien aplica
 
@@ -14,7 +14,7 @@ JSON en `camelCase`. Toda petición lleva la cabecera `x-api-key` (excepto `GET 
 | Las 4 alertas de seguimiento urgente | Se calculan de lo respondido (`alertas`). No son casillas. |
 | Fecha de aplicación | Hoy por defecto (no admite fecha futura). |
 | Versión del consentimiento | Constante del front (ej. `"v1"`). |
-| Quién aplica | Se pide una vez por dispositivo y se recuerda (`aplicadaPor`). |
+| Quién aplica | Sale de la sesión (correo del voluntario). **No se envía**; si mandas `aplicadaPor` responde 400. |
 | Qué falta para completar | La base lo dice (`faltantes`); el front no duplica esa lógica. |
 
 ## 2. Flujo
@@ -29,7 +29,7 @@ PUT  /hogares/:ref/atencion           → Mód.4 (quién ha pasado, ayudas que d
 PUT  /hogares/:ref/contacto           → corregir dirección/nombre/teléfono (solo escribe)
 GET  /hogares/:ref/progreso           → pasos hechos, faltantes, alertas
 POST /hogares/:ref/completar          → cierra (400 con la lista si falta algo)
-GET  /hogares?estado=&aplicadaPor=&limite=&desde=   → avance de los hogares (sin datos personales)
+GET  /hogares?estado=&limite=&desde=   → avance de TUS hogares (sin datos personales)
 GET  /salud                           → { "estado": "ok" } (público, para el despliegue)
 ```
 
@@ -62,7 +62,7 @@ GET  /salud                           → { "estado": "ok" } (público, para el 
 
 `faltantes` son frases listas para mostrar (p. ej. `"vivienda: dónde pernoctó la familia"`). `alertas` se muestran en solo lectura en la pantalla de cierre y se resaltan si alguna es `true`; son parciales hasta tener todas las respuestas.
 
-`GET /hogares` devuelve una lista de objetos con `ref, codigo, estado, sector, fechaAplicacion, aplicadaPor, actualizadoEn, pasos, requiereSeguimiento` (ordenados por última actualización).
+Cada voluntario solo ve y edita los hogares que creó (de los ajenos responde `404`). `GET /hogares` devuelve una lista de objetos con `ref, codigo, estado, sector, fechaAplicacion, aplicadaPor, actualizadoEn, pasos, requiereSeguimiento` (ordenados por última actualización).
 
 ## 4. Endpoints
 
@@ -73,7 +73,6 @@ Opciones con `{ codigo, etiqueta }` para cada pregunta: `triestado`, `generos`, 
 ### `POST /hogares` → `201`
 ```json
 {
-  "aplicadaPor": "Ana Pérez",
   "autorizaTratamiento": true,
   "autorizaSeguimiento": false,
   "versionConsentimiento": "v1",
@@ -83,7 +82,7 @@ Opciones con `{ codigo, etiqueta }` para cada pregunta: `triestado`, `generos`, 
   "observaciones": "texto libre"
 }
 ```
-* **Si NO autoriza**: envía solo `aplicadaPor`, `autorizaTratamiento: false`, `versionConsentimiento` (y opcionalmente `sector`). Responde `estado: "sin_autorizacion"` y **el asistente termina**. Si envías datos personales, responde `400`.
+* **Si NO autoriza**: envía solo `autorizaTratamiento: false`, `versionConsentimiento` (y opcionalmente `sector`). Responde `estado: "sin_autorizacion"` y **el asistente termina**. Si envías datos personales, responde `400`.
 * `autorizaSeguimiento` solo puede ser `true` si autoriza el tratamiento.
 * `fechaAplicacion` (opcional, `YYYY-MM-DD`, no futura). Teléfono: 7–30 caracteres entre dígitos, `+ ( ) -` y espacios.
 * Una misma dirección (+ interior) no se registra dos veces: responde `409` *"Ya existe un hogar registrado con esa dirección; consulta con coordinación"*.
@@ -176,22 +175,23 @@ Las entregas reales se registran en `entrega_ayuda` (estados `en_revision` → `
 * **Sin lectura de datos sensibles desde el front**: ningún endpoint los devuelve, y además el rol de base de datos de la API (`rol_formulario`) **no tiene permiso de lectura** sobre `hogar_contacto` (nombre, dirección, teléfono, observaciones). Aunque la API tuviera un fallo, no podría filtrarlos.
 * **Datos personales aislados** en una sola tabla; el resto de la ficha no identifica a nadie por sí sola.
 * **Identificadores no adivinables** (`ref` uuid) en las rutas.
-* **Clave de API** (`x-api-key`, comparación en tiempo constante, rotación con varias claves), **tope de peticiones por IP** y bloqueo temporal tras 10 claves erróneas.
+* **Login por voluntario** (Supabase Auth): token individual y revocable, verificado por la API contra Supabase; solo entra quien fue invitado y aceptó la invitación (el registro público está desactivado). Cada voluntario solo accede a sus hogares y la bitácora registra su correo. **Tope de peticiones por IP** y bloqueo temporal tras 20 sesiones inválidas.
 * **CORS cerrado** a los orígenes de `CORS_ORIGIN`; cabeceras seguras y `Cache-Control: no-store`; cuerpo máximo 100 KB.
 * **Reglas de integridad en la base** (CHECK + `hogar_faltantes`): nadie puede dejar una ficha incoherente saltándose la API.
 * **Sin datos personales en logs**: los errores de la base se registran sin parámetros.
 * **RLS** activo en todas las tablas y cero acceso para `anon`/`authenticated` de Supabase; **bitácora** de cambios; **revocación del consentimiento**.
-* **Límite conocido**: una clave de API embebida en una web pública no es secreta (cualquiera con las herramientas del navegador la ve). Frena el tráfico anónimo, pero para identificar a cada voluntario hace falta autenticación por usuario (p. ej. Supabase Auth con JWT).
+* **Sin secretos en el front**: el front solo lleva la URL y la `anon key` de Supabase, públicas por diseño. Si se roba una sesión, se revoca ese usuario (efecto en máximo 60 s) sin tocar a los demás.
 
 ## 8. Errores
 
 | Código | Cuándo | Cuerpo |
 |---|---|---|
 | `400` | Forma inválida, regla de coherencia o falta algo para completar | `{ "message": "texto" }` o `{ "message": ["…", "…"] }` |
-| `401` | Falta la clave o es inválida | `{ "message": "Clave de API inválida o ausente" }` |
-| `404` | El hogar no existe (o `ref` inexistente) | `{ "message": "No existe el hogar" }` |
+| `401` | Sin sesión, token vencido, inválido o correo sin confirmar → pedir login de nuevo | `{ "message": "Sesión inválida o vencida: inicia sesión de nuevo" }` |
+| `404` | El hogar no existe o no es tuyo | `{ "message": "No existe el hogar" }` |
 | `409` | Hogar ya no editable, o dirección repetida | `{ "message": "El hogar está 'completo' y ya no se puede modificar" }` |
-| `429` | Demasiadas peticiones / intentos fallidos | `{ "message": "…" }` |
+| `429` | Demasiadas peticiones / sesiones inválidas |
+| `503` | No se pudo verificar la sesión con Supabase; reintenta | `{ "message": "…" }` |
 | `500` | Error inesperado (no revela detalles) | `{ "message": "No fue posible guardar la información" }` |
 
 `message` puede ser texto o arreglo de textos: muéstralo siempre como lista.

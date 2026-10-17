@@ -50,8 +50,6 @@ const Conteo = (max = 60) => (target: object, key: string) => {
 
 // ---------- POST /hogares ----------
 export class CrearHogarDto {
-  /** Quien aplica la ficha. */
-  @Trim() @IsString() @IsNotEmpty() @MaxLength(150) aplicadaPor!: string;
   @IsOptional() @IsDateString({ strict: true }) @IsNotFutureDate() fechaAplicacion?: string;
   @IsBoolean() autorizaTratamiento!: boolean;
   @IsOptional() @IsBoolean() autorizaSeguimiento?: boolean;
@@ -164,7 +162,6 @@ export class AtencionDto {
 // ---------- GET /hogares ----------
 export class ListarHogaresDto {
   @IsOptional() @IsIn(ESTADOS_HOGAR) estado?: string;
-  @Trim() @IsOptional() @IsString() @MaxLength(150) aplicadaPor?: string;
   /** Cantidad máxima de hogares a devolver (por defecto 100). */
   @IsOptional() @Type(() => Number) @IsInt() @Min(1) @Max(500) limite?: number;
   /** Cuántos saltar, para paginar (por defecto 0). */

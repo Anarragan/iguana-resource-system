@@ -32,7 +32,7 @@ async function bootstrap() {
   app.enableCors({
     origin: origenes?.length ? origenes : process.env.NODE_ENV !== 'production',
     methods: ['GET', 'POST', 'PUT'],
-    allowedHeaders: ['Content-Type', 'x-api-key'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
     maxAge: 600,
   });
 

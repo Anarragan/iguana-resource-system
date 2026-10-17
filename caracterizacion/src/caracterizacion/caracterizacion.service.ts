@@ -10,6 +10,7 @@ import {
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource, EntityManager } from 'typeorm';
 import { CATALOGOS } from '../domain/catalogos.js';
+import type { Usuario } from '../seguridad/usuario.js';
 import { ContactoDto, CrearHogarDto, ListarHogaresDto } from './dto/hogar.dto.js';
 import { SECCIONES, snake, type Seccion } from './secciones.js';
 
@@ -54,12 +55,12 @@ export class CaracterizacionService {
   }
 
   /** Avance de los hogares: códigos y pasos, nunca nombres, direcciones ni respuestas. */
-  async listar({ estado, aplicadaPor, limite = 100, desde = 0 }: ListarHogaresDto) {
+  async listar({ estado, limite = 100, desde = 0 }: ListarHogaresDto, usuario: Usuario) {
     const filtros: string[] = [];
     const params: unknown[] = [];
     if (estado) filtros.push(`estado = $${params.push(estado)}`);
-    if (aplicadaPor) filtros.push(`aplicada_por = $${params.push(aplicadaPor)}`);
-    const donde = filtros.length ? `WHERE ${filtros.join(' AND ')}` : '';
+    filtros.push(`aplicada_por = $${params.push(usuario.email)}`); // cada voluntario ve solo lo suyo
+    const donde = `WHERE ${filtros.join(' AND ')}`;
     const filas: Fila[] = await this.db.query(
       `SELECT * FROM v_progreso_hogar ${donde} ORDER BY updated_at DESC LIMIT $${params.push(limite)} OFFSET $${params.push(desde)}`,
       params,
@@ -68,7 +69,7 @@ export class CaracterizacionService {
   }
 
   /** Crea el hogar en borrador (o 'sin_autorizacion', sin guardar ningún dato personal). */
-  crear(dto: CrearHogarDto) {
+  crear(dto: CrearHogarDto, usuario: Usuario) {
     const { autorizaTratamiento: autoriza } = dto;
     const personales = [dto.direccion, dto.interior, dto.callejon, dto.nombreReferencia, dto.telefonoContacto, dto.observaciones];
     if (!autoriza && personales.some(Boolean)) {
@@ -78,7 +79,7 @@ export class CaracterizacionService {
       throw new BadRequestException('No se puede autorizar el seguimiento sin autorizar el tratamiento de datos');
     }
 
-    return this.tx(dto.aplicadaPor, async (m) => {
+    return this.tx(usuario.email, async (m) => {
       const [hogar] = await m.query(
         `INSERT INTO hogar (sector, autoriza_tratamiento, autoriza_seguimiento, version_consentimiento,
                             fecha_aplicacion, aplicada_por, estado)
@@ -90,7 +91,7 @@ export class CaracterizacionService {
           autoriza && (dto.autorizaSeguimiento ?? false),
           dto.versionConsentimiento,
           dto.fechaAplicacion ?? null,
-          dto.aplicadaPor,
+          usuario.email,
           autoriza ? 'borrador' : 'sin_autorizacion',
         ],
       );
@@ -107,8 +108,8 @@ export class CaracterizacionService {
   }
 
   /** Corrige los datos de contacto (la API puede escribirlos pero nunca leerlos). */
-  guardarContacto(ref: string, dto: ContactoDto) {
-    return this.editar(ref, async (m, id) => {
+  guardarContacto(ref: string, dto: ContactoDto, usuario: Usuario) {
+    return this.editar(ref, usuario, async (m, id) => {
       const [, filas] = await m.query(
         `UPDATE hogar_contacto
             SET direccion = $2, interior = $3, callejon = $4, nombre_referencia = $5, telefono_contacto = $6, observaciones = $7
@@ -121,7 +122,7 @@ export class CaracterizacionService {
   }
 
   /** Reemplaza completo un paso: lo que no se envía queda vacío (o en su valor por defecto). */
-  guardarSeccion(ref: string, seccion: Seccion, dto: object) {
+  guardarSeccion(ref: string, seccion: Seccion, dto: object, usuario: Usuario) {
     const { tabla, campos } = SECCIONES[seccion];
     const valores = dto as Fila;
     const enviados = campos.filter((c) => valores[c] != null);
@@ -129,18 +130,18 @@ export class CaracterizacionService {
     const sql = `INSERT INTO ${tabla} (id_hogar${columnas.map((c) => `, ${c}`).join('')})
                  VALUES ($1${columnas.map((_, i) => `, $${i + 2}`).join('')})
                  ON CONFLICT (id_hogar) DO UPDATE SET ${campos.map((c) => `${snake(c)} = EXCLUDED.${snake(c)}`).join(', ')}`;
-    return this.editar(ref, (m, id) => m.query(sql, [id, ...enviados.map((c) => valores[c])]));
+    return this.editar(ref, usuario, (m, id) => m.query(sql, [id, ...enviados.map((c) => valores[c])]));
   }
 
   /** Cierra la ficha. La base decide si está completa y, si no, dice qué falta. */
-  completar(ref: string) {
-    return this.editar(ref, (m, id) => m.query(`UPDATE hogar SET estado = 'completo' WHERE id_hogar = $1`, [id]));
+  completar(ref: string, usuario: Usuario) {
+    return this.editar(ref, usuario, (m, id) => m.query(`UPDATE hogar SET estado = 'completo' WHERE id_hogar = $1`, [id]));
   }
 
-  async obtenerProgreso(ref: string) {
+  async obtenerProgreso(ref: string, usuario: Usuario) {
     return this.tx(null, async (m) => {
-      const [h] = await m.query(`SELECT id_hogar FROM hogar WHERE ref = $1`, [ref]);
-      if (!h) throw new NotFoundException('No existe el hogar');
+      const [h] = await m.query(`SELECT id_hogar, aplicada_por FROM hogar WHERE ref = $1`, [ref]);
+      this.exigirPropio(h, usuario);
       return this.progreso(m, h.id_hogar);
     });
   }
@@ -159,16 +160,21 @@ export class CaracterizacionService {
   }
 
   /** Bloquea el hogar, exige que siga en borrador y ejecuta el cambio; devuelve el avance actualizado. */
-  private editar(ref: string, fn: (m: EntityManager, idHogar: string) => Promise<unknown>) {
+  private editar(ref: string, usuario: Usuario, fn: (m: EntityManager, idHogar: string) => Promise<unknown>) {
     return this.tx(null, async (m) => {
       const [h] = await m.query(`SELECT id_hogar, estado, aplicada_por FROM hogar WHERE ref = $1 FOR UPDATE`, [ref]);
-      if (!h) throw new NotFoundException('No existe el hogar');
+      this.exigirPropio(h, usuario);
       if (h.estado === 'sin_autorizacion') throw new ConflictException('La familia no autorizó el tratamiento de datos: no se admite más información');
       if (h.estado !== 'borrador') throw new ConflictException(`El hogar está '${h.estado}' y ya no se puede modificar`);
       await m.query(`SELECT set_config('app.actor', $1, true)`, [h.aplicada_por]);
       await fn(m, h.id_hogar);
       return this.progreso(m, h.id_hogar);
     });
+  }
+
+  /** Un voluntario solo toca sus hogares; de los ajenos responde 404 para no revelar que existen. */
+  private exigirPropio(h: Fila | undefined, usuario: Usuario) {
+    if (h?.aplicada_por !== usuario.email) throw new NotFoundException('No existe el hogar');
   }
 
   /** Lo único que se devuelve al front: avance, qué falta y alertas calculadas. */
