@@ -1,41 +1,55 @@
-import { randomUUID } from 'node:crypto';
 import {
+  BadRequestException,
+  ConflictException,
+  HttpException,
   Injectable,
   InternalServerErrorException,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
-import { DataSource } from 'typeorm';
-import { Hogar } from '../domain/entities/hogar.js';
-import { Familia } from '../domain/entities/familia.js';
-import { Persona } from '../domain/entities/persona.js';
-import { Afectacion } from '../domain/entities/afectacion.js';
-import { Necesidad } from '../domain/entities/necesidad.js';
-import type {
-  CategoriaAfectacion,
-  CategoriaNecesidad,
-  NivelAfectacion,
-  NivelUrgencia,
-} from '../domain/enums.ts';
+import { DataSource, EntityManager } from 'typeorm';
+import { Hogar, Vivienda, Voluntario } from '../domain/entities/hogar.js';
+import { Ficha } from '../domain/entities/ficha.js';
 import {
-  CATEGORIAS_AFECTACION,
-  CATEGORIAS_NECESIDAD,
-  NIVELES_AFECTACION,
-  NIVELES_URGENCIA,
-  SECTOR,
-} from '../domain/catalogos.js';
-import { CrearCaracterizacionDto } from './dto/crear-caracterizacion.dto.js';
+  Actor,
+  CategoriaDano,
+  GrupoIntegrantes,
+  GrupoNecesidad,
+  ItemNecesidad,
+  TipoAyuda,
+} from '../domain/entities/catalogo.js';
+import {
+  Atencion,
+  Dano,
+  Escolaridad,
+  Grupo,
+  Menor,
+  Respondente,
+  Situacion,
+  Visitante,
+} from '../domain/entities/secciones.js';
+import { Necesidad } from '../domain/entities/necesidad.js';
+import { EntregaAyuda } from '../domain/entities/entrega_ayuda.js';
+import type { Id } from '../domain/enums.ts';
+import {
+  AtencionDto,
+  CrearFichaDto,
+  DanosDto,
+  GruposDto,
+  NecesidadesDto,
+  VisitantesDto,
+} from './dto/crear-caracterizacion.dto.js';
 
-const PREFIJO_HOGAR = 'HOG';
-const PREFIJO_FAMILIA = 'FAM';
+const SECTOR = 'La Iguaná';
+const SIN_AUTORIZACION = 'Sin autorización';
+const PREFIJO_HOGAR = 'IG';
 
-/** HOG-0001, FAM-0001... crece a más dígitos si hace falta. */
-const formatearCodigo = (prefijo: string, id: number) =>
-  `${prefijo}-${String(id).padStart(4, '0')}`;
+/** Violaciones de FK (23503), UNIQUE (23505) y CHECK (23514): el dato es inválido, no el servidor. */
+const REGLAS_BD = ['23503', '23505', '23514'];
 
-/** Marcador único (≤20 caracteres, límite de la columna) mientras se conoce el id definitivo. */
-const codigoTemporal = () => `TMP${randomUUID().replaceAll('-', '').slice(0, 16)}`;
+type Clase<T> = new () => T;
+type Fila = Record<string, unknown>;
 
 @Injectable()
 export class CaracterizacionService {
@@ -43,217 +57,277 @@ export class CaracterizacionService {
 
   constructor(@InjectDataSource() private readonly dataSource: DataSource) {}
 
+  /** Las 6 listas del formulario, ya ordenadas. */
   async catalogos() {
-    return {
-      categoriasAfectacion: CATEGORIAS_AFECTACION,
-      nivelesAfectacion: NIVELES_AFECTACION,
-      categoriasNecesidad: CATEGORIAS_NECESIDAD,
-      nivelesUrgencia: NIVELES_URGENCIA,
-    };
+    const m = this.dataSource.manager;
+    const [gruposIntegrantes, categoriasDano, gruposNecesidad, itemsNecesidad, actores, tiposAyuda] =
+      await Promise.all([
+        m.find(GrupoIntegrantes, { order: { orden: 'ASC' } }),
+        m.find(CategoriaDano, { order: { orden: 'ASC' } }),
+        m.find(GrupoNecesidad, { order: { orden: 'ASC' } }),
+        m.find(ItemNecesidad, { order: { grupo: 'ASC', orden: 'ASC' } }),
+        m.find(Actor, { order: { codigo: 'ASC' } }),
+        m.find(TipoAyuda, { order: { codigo: 'ASC' } }),
+      ]);
+    return { gruposIntegrantes, categoriasDano, gruposNecesidad, itemsNecesidad, actores, tiposAyuda };
   }
 
   async listar(limite: number, desde: number) {
-    const filas: {
-      id_familia: string;
-      codigo_familia: string;
-      nombre_referencia: string;
-      telefono_contacto: string | null;
-      fecha_caracterizacion: Date;
-      estado_verificacion: string;
-      id_hogar: string;
-      codigo_hogar: string;
-      direccion: string;
-      sector: string;
-      observaciones: string | null;
-      personas: number;
-      afectaciones: number;
-      necesidades: number;
-    }[] = await this.dataSource.query(
-      `SELECT f.id_familia, f.codigo_familia, f.nombre_referencia, f.telefono_contacto,
-              f.fecha_caracterizacion, f.estado_verificacion,
-              h.id_hogar, h.codigo_hogar, h.direccion, h.sector, h.observaciones,
-              (SELECT count(*)::int FROM persona p WHERE p.id_familia = f.id_familia) AS personas,
-              (SELECT count(*)::int FROM afectacion a WHERE a.id_familia = f.id_familia) AS afectaciones,
-              (SELECT count(*)::int FROM necesidad n WHERE n.id_familia = f.id_familia) AS necesidades
-         FROM familia f
+    return this.dataSource.query(
+      `SELECT f.id_ficha AS "idFicha", f.estado, f.fecha_aplicacion AS "fechaAplicacion",
+              h.id_hogar AS "idHogar", h.codigo_hogar AS "codigoHogar", h.nombre_referencia AS "nombreReferencia",
+              v.direccion, r.ninos, r.adultos_mayores AS "adultosMayores", r.num_personas AS "numPersonas",
+              r.total_dano AS "totalDano"
+         FROM ficha f
          JOIN hogar h ON h.id_hogar = f.id_hogar
-        ORDER BY f.fecha_caracterizacion DESC, f.id_familia DESC
-        LIMIT $1 OFFSET $2`,
+         JOIN vivienda v ON v.id_vivienda = h.id_vivienda
+         JOIN v_ficha_resumen r ON r.id_ficha = f.id_ficha
+        ORDER BY f.id_ficha DESC LIMIT $1 OFFSET $2`,
       [limite, desde],
     );
-
-    return filas.map((r) => ({
-      familia: {
-        id: Number(r.id_familia),
-        codigo: r.codigo_familia,
-        nombreReferencia: r.nombre_referencia,
-        telefonoContacto: r.telefono_contacto,
-        fechaCaracterizacion: r.fecha_caracterizacion,
-        estadoVerificacion: r.estado_verificacion,
-      },
-      hogar: {
-        id: Number(r.id_hogar),
-        codigo: r.codigo_hogar,
-        direccionReferencia: r.direccion,
-        sector: r.sector,
-        observaciones: r.observaciones,
-      },
-      resumen: {
-        personas: r.personas,
-        afectaciones: r.afectaciones,
-        necesidades: r.necesidades,
-      },
-    }));
   }
 
-  /** `idFamilia`: id de la familia; el hogar se resuelve por su relación. */
-  async obtener(idFamilia: number) {
-    const manager = this.dataSource.manager;
-    const familia = await manager.findOne(Familia, {
-      where: { idFamilia },
-      relations: { hogar: true },
-    });
-    if (!familia?.hogar) {
-      throw new NotFoundException(`No existe una familia con id ${idFamilia}`);
+  /** Ejecuta en transacción y traduce las reglas de la base a 400. */
+  private async tx<T>(fn: (m: EntityManager) => Promise<T>): Promise<T> {
+    try {
+      return await this.dataSource.transaction(fn);
+    } catch (error) {
+      if (error instanceof HttpException) throw error;
+      const driver = (error as { driverError?: { code?: string; constraint?: string } }).driverError;
+      if (driver?.code && REGLAS_BD.includes(driver.code)) {
+        throw new BadRequestException(`Dato inválido (${driver.constraint ?? driver.code})`);
+      }
+      this.logger.error('Error al guardar la ficha', error);
+      throw new InternalServerErrorException('No fue posible guardar la ficha');
     }
-    const { hogar, ...datosFamilia } = familia;
+  }
 
-    const [personas, afectaciones, necesidades] = await Promise.all([
-      manager.find(Persona, { where: { idFamilia }, order: { idPersona: 'ASC' } }),
-      manager.find(Afectacion, { where: { idFamilia }, order: { idAfectacion: 'ASC' } }),
-      manager.find(Necesidad, { where: { idFamilia }, order: { idNecesidad: 'ASC' } }),
-    ]);
+  /** Crea hogar (si hace falta) y ficha. Sin autorización la ficha nace 'sin_autorizacion' y no guarda datos personales. */
+  crear(dto: CrearFichaDto) {
+    const autoriza = dto.autorizaTratamiento;
+    if (autoriza && !dto.idHogar && !(dto.vivienda && dto.hogar)) {
+      throw new BadRequestException('Con autorización se requiere idHogar o vivienda y hogar');
+    }
+    return this.tx(async (m) => {
+      let idHogar = dto.idHogar;
+      if (idHogar) {
+        if (!(await m.existsBy(Hogar, { idHogar }))) throw new NotFoundException(`No existe el hogar ${idHogar}`);
+      } else {
+        const vivienda = await m.save(
+          m.create(Vivienda, {
+            direccion: autoriza ? dto.vivienda!.direccion : SIN_AUTORIZACION,
+            interior: (autoriza && dto.vivienda?.interior) || null,
+            callejon: (autoriza && dto.vivienda?.callejon) || null,
+            sector: SECTOR,
+            materialParedes: (autoriza && dto.vivienda?.materialParedes) || null,
+            nivelAguaMax: (autoriza && dto.vivienda?.nivelAguaMax) || null,
+            inundadaAntes: (autoriza && dto.vivienda?.inundadaAntes) || undefined,
+          }),
+        );
+        // El código sale del id que asigna la base: se inserta con uno temporal único y se corrige en la misma transacción.
+        const hogar = await m.save(
+          m.create(Hogar, {
+            codigoHogar: `TMP${crypto.randomUUID().replaceAll('-', '').slice(0, 16)}`,
+            idVivienda: vivienda.idVivienda,
+            nombreReferencia: autoriza ? dto.hogar!.nombreReferencia : SIN_AUTORIZACION,
+            telefonoContacto: (autoriza && dto.hogar?.telefonoContacto) || null,
+          }),
+        );
+        idHogar = hogar.idHogar;
+        await m.update(Hogar, { idHogar }, { codigoHogar: `${PREFIJO_HOGAR}-${String(idHogar).padStart(4, '0')}` });
+      }
 
+      const voluntario =
+        (await m.findOneBy(Voluntario, { nombre: dto.voluntario })) ??
+        (await m.save(m.create(Voluntario, { nombre: dto.voluntario })));
+
+      const ficha = await m.save(
+        m.create(Ficha, {
+          idHogar,
+          idVoluntario: voluntario.idVoluntario,
+          fechaAplicacion: dto.fechaAplicacion,
+          estado: autoriza ? 'borrador' : 'sin_autorizacion',
+          autorizaTratamiento: autoriza,
+          autorizaSeguimiento: autoriza && (dto.autorizaSeguimiento ?? false),
+          versionConsentimiento: dto.versionConsentimiento,
+          observaciones: (autoriza && dto.observaciones) || null,
+        }),
+      );
+      return { idFicha: ficha.idFicha, idHogar, estado: ficha.estado };
+    });
+  }
+
+  /** Paso con una sola fila (respondente, escolaridad, situación). */
+  guardarUno<T extends { idFicha: Id }>(id: number, entidad: Clase<T>, dto: object) {
+    return this.editar(id, (m) => this.reemplazar(m, entidad, id, [dto]));
+  }
+
+  guardarAtencion(id: number, { ayudasRecibidas, ...dto }: AtencionDto) {
+    return this.editar(id, async (m) => {
+      await this.reemplazar(m, Atencion, id, [dto]);
+      const { idHogar } = await m.findOneByOrFail(Ficha, { idFicha: id });
+      await m.delete(EntregaAyuda, { idFicha: id, estado: 'reportada' });
+      await this.reemplazar(
+        m,
+        EntregaAyuda,
+        id,
+        (ayudasRecibidas ?? []).map((tipoAyuda) => ({ idHogar, tipoAyuda, estado: 'reportada' })),
+        false,
+      );
+    });
+  }
+
+  guardarDanos(id: number, { danos }: DanosDto) {
+    return this.editar(id, async (m) => {
+      // Siempre las filas de todas las categorías del catálogo, cada una una vez.
+      const esperadas = (await m.find(CategoriaDano)).map((c) => c.codigo).sort();
+      const recibidas = danos.map((d) => d.categoria).sort();
+      if (esperadas.join() !== recibidas.join()) {
+        throw new BadRequestException(`danos debe traer exactamente una vez: ${esperadas.join(', ')}`);
+      }
+      await this.reemplazar(m, Dano, id, danos);
+    });
+  }
+
+  guardarNecesidades(id: number, { necesidades }: NecesidadesDto) {
+    return this.editar(id, async (m) => {
+      if (necesidades.some((n) => n.item === 'otro_condicion_especial' && !n.detalle)) {
+        throw new BadRequestException("'otro_condicion_especial' requiere detalle");
+      }
+      await this.reemplazar(m, Necesidad, id, necesidades);
+    });
+  }
+
+  guardarVisitantes(id: number, { visitantes }: VisitantesDto) {
+    return this.editar(id, async (m) => {
+      if (visitantes.some((v) => v.actor === 'nadie') && visitantes.length > 1) {
+        throw new BadRequestException("'nadie' excluye a los demás visitantes");
+      }
+      await this.reemplazar(m, Visitante, id, visitantes);
+    });
+  }
+
+  guardarGrupos(id: number, { numPersonas, menores, grupos }: GruposDto) {
+    return this.editar(id, async (m) => {
+      await m.update(Ficha, { idFicha: id }, { numPersonas });
+      await this.reemplazar(m, Menor, id, menores.map((edad) => ({ edad })));
+      await this.reemplazar(m, Grupo, id, grupos);
+    });
+  }
+
+  /** Valida lo que la base no puede (reglas entre tablas) y pasa la ficha a 'completa'. */
+  completar(id: number) {
+    return this.tx(async (m) => {
+      const ficha = await this.borrador(m, id);
+      const [respondente, situacion, menores, grupos, danos, categorias] = await Promise.all([
+        m.countBy(Respondente, { idFicha: id }),
+        m.findOneBy(Situacion, { idFicha: id }),
+        m.countBy(Menor, { idFicha: id }),
+        m.findBy(Grupo, { idFicha: id }),
+        m.countBy(Dano, { idFicha: id }),
+        m.count(CategoriaDano),
+      ]);
+      const errores: string[] = [];
+      if (ficha.numPersonas == null) errores.push('falta numPersonas');
+      if (!respondente) errores.push('falta el respondente');
+      if (!situacion?.lugarPernocta) errores.push('falta dónde pernoctó la familia (situacion.lugarPernocta)');
+      if (danos !== categorias) errores.push(`danos debe tener las ${categorias} categorías`);
+      if (ficha.numPersonas != null) {
+        if (menores > ficha.numPersonas) errores.push('los menores superan numPersonas');
+        for (const g of grupos) {
+          if (g.cantidad > ficha.numPersonas) errores.push(`${g.grupo} supera numPersonas`);
+        }
+      }
+      if (errores.length) throw new BadRequestException(errores);
+
+      await m.update(Ficha, { idFicha: id }, { estado: 'completa', updatedAt: new Date() });
+      return { idFicha: id, estado: 'completa' };
+    });
+  }
+
+  async obtener(id: number) {
+    const m = this.dataSource.manager;
+    const ficha = await m.findOne(Ficha, {
+      where: { idFicha: id },
+      relations: { hogar: { vivienda: true }, voluntario: true },
+    });
+    if (!ficha) throw new NotFoundException(`No existe la ficha ${id}`);
+
+    const por = { idFicha: id };
+    const [respondente, escolaridad, situacion, atencion, menores, grupos, danos, necesidades, visitantes, ayudas, resumen, seguimiento] =
+      await Promise.all([
+        m.findOneBy(Respondente, por),
+        m.findOneBy(Escolaridad, por),
+        m.findOneBy(Situacion, por),
+        m.findOneBy(Atencion, por),
+        m.find(Menor, { where: por, order: { idMenor: 'ASC' } }),
+        m.findBy(Grupo, por),
+        m.findBy(Dano, por),
+        m.find(Necesidad, { where: por, order: { idNecesidad: 'ASC' } }),
+        m.findBy(Visitante, por),
+        m.findBy(EntregaAyuda, por),
+        this.dataSource.query(
+          `SELECT num_personas AS "numPersonas", ninos, adultos_mayores AS "adultosMayores", total_dano AS "totalDano"
+             FROM v_ficha_resumen WHERE id_ficha = $1`,
+          [id],
+        ),
+        this.dataSource.query(
+          `SELECT duerme_en_riesgo AS "duermeEnRiesgo", urgente_salud AS "urgenteSalud",
+                  urgente_agua_alimento AS "urgenteAguaAlimento", electrica_riesgo AS "electricaRiesgo",
+                  (duerme_en_riesgo OR urgente_salud OR urgente_agua_alimento OR electrica_riesgo) AS "requiereSeguimiento"
+             FROM v_seguimiento_urgente WHERE id_ficha = $1`,
+          [id],
+        ),
+      ]);
+
+    const { hogar, voluntario, ...cabecera } = ficha;
+    const { vivienda, ...datosHogar } = hogar!;
     return {
-      hogar: {
-        id: hogar.idHogar,
-        codigo: hogar.codigoHogar,
-        direccionReferencia: hogar.direccionReferencia,
-        sector: hogar.sector,
-        observaciones: hogar.observaciones,
-        fechaRegistro: hogar.fechaRegistro,
-      },
-      familia: {
-        id: datosFamilia.idFamilia,
-        codigo: datosFamilia.codigoFamilia,
-        nombreReferencia: datosFamilia.nombreReferencia,
-        telefonoContacto: datosFamilia.telefonoContacto,
-        fechaCaracterizacion: datosFamilia.fechaCaracterizacion,
-        estadoVerificacion: datosFamilia.estadoVerificacion,
-      },
-      personas: personas.map((p) => ({
-        id: p.idPersona,
-        nombres: p.nombres,
-        fechaNacimiento: p.fechaNacimiento,
-        requiereApoyo: p.requiereApoyo,
-        observaciones: p.observaciones,
-      })),
-      afectaciones: afectaciones.map((a) => ({
-        id: a.idAfectacion,
-        categoria: a.categoria,
-        descripcion: a.descripcion,
-        nivelAfectacion: a.nivelAfectacion,
-        fechaReporte: a.fechaReporte,
-        estadoVerificacion: a.estadoVerificacion,
-      })),
-      necesidades: necesidades.map((n) => ({
-        id: n.idNecesidad,
-        categoria: n.categoria,
-        descripcion: n.descripcion,
-        nivelUrgencia: n.nivelUrgencia,
-        estado: n.estado,
-        fechaRegistro: n.fechaRegistro,
-      })),
+      ...cabecera,
+      voluntario: voluntario?.nombre,
+      hogar: { ...datosHogar, vivienda },
+      respondente,
+      escolaridad,
+      situacion,
+      atencion,
+      menores: menores.map((x) => x.edad),
+      grupos,
+      danos,
+      necesidades,
+      visitantes,
+      ayudasRecibidas: ayudas,
+      resumen: resumen[0],
+      seguimiento: seguimiento[0] ?? null, // solo existe para fichas completas
     };
   }
 
-  /** Registra hogar, familia, personas, afectaciones y necesidades de forma atómica. */
-  async crear(dto: CrearCaracterizacionDto) {
-    try {
-      return await this.dataSource.transaction(async (manager) => {
-        // El código se deriva del id que asigna la base, que solo se conoce tras el
-        // insert; por eso se inserta con un valor temporal único y se actualiza
-        // dentro de la misma transacción (nunca queda visible).
-        const hogar = await manager.save(
-          manager.create(Hogar, {
-            codigoHogar: codigoTemporal(),
-            direccionReferencia: dto.hogar.direccionReferencia,
-            sector: SECTOR,
-            observaciones: dto.hogar.observaciones ?? null,
-          }),
-        );
-        hogar.codigoHogar = formatearCodigo(PREFIJO_HOGAR, hogar.idHogar);
-        await manager.update(Hogar, { idHogar: hogar.idHogar }, { codigoHogar: hogar.codigoHogar });
+  // ---------- helpers ----------
+  /** La ficha debe existir y seguir en borrador; si no, 404 / 409. */
+  private async borrador(m: EntityManager, id: number): Promise<Ficha> {
+    const ficha = await m.findOneBy(Ficha, { idFicha: id });
+    if (!ficha) throw new NotFoundException(`No existe la ficha ${id}`);
+    if (ficha.estado !== 'borrador') throw new ConflictException(`La ficha está '${ficha.estado}' y no se puede modificar`);
+    return ficha;
+  }
 
-        const familia = await manager.save(
-          manager.create(Familia, {
-            codigoFamilia: codigoTemporal(),
-            idHogar: hogar.idHogar,
-            nombreReferencia: dto.familia.nombreReferencia,
-            telefonoContacto: dto.familia.telefonoContacto ?? null,
-          }),
-        );
-        familia.codigoFamilia = formatearCodigo(PREFIJO_FAMILIA, familia.idFamilia);
-        await manager.update(
-          Familia,
-          { idFamilia: familia.idFamilia },
-          { codigoFamilia: familia.codigoFamilia },
-        );
+  private editar(id: number, fn: (m: EntityManager) => Promise<unknown>) {
+    return this.tx(async (m) => {
+      await this.borrador(m, id);
+      await fn(m);
+      await m.update(Ficha, { idFicha: id }, { updatedAt: new Date() });
+      return { idFicha: id, guardado: true };
+    });
+  }
 
-        const personas = await manager.save(
-          dto.personas.map((p) =>
-            manager.create(Persona, {
-              idFamilia: familia.idFamilia,
-              nombres: p.nombres,
-              fechaNacimiento: p.fechaNacimiento ?? null,
-              requiereApoyo: p.requiereApoyo ?? false,
-              observaciones: p.observaciones ?? null,
-            }),
-          ),
-        );
+  /** Quita null/undefined para que la base ponga el valor por defecto en las columnas esenciales. */
+  private sinNulos(fila: object): Fila {
+    return Object.fromEntries(Object.entries(fila).filter(([, v]) => v != null));
+  }
 
-        const afectaciones = await manager.save(
-          dto.afectaciones.map((a) =>
-            manager.create(Afectacion, {
-              idFamilia: familia.idFamilia,
-              categoria: a.categoria as CategoriaAfectacion,
-              descripcion: a.descripcion,
-              nivelAfectacion: a.nivelAfectacion as NivelAfectacion,
-            }),
-          ),
-        );
-
-        const necesidades = await manager.save(
-          dto.necesidades.map((n) =>
-            manager.create(Necesidad, {
-              idFamilia: familia.idFamilia,
-              categoria: n.categoria as CategoriaNecesidad,
-              descripcion: n.descripcion,
-              nivelUrgencia: n.nivelUrgencia as NivelUrgencia,
-            }),
-          ),
-        );
-
-        // Contrato de salida: lo que la pantalla "Caracterización registrada" muestra.
-        return {
-          mensaje: 'Caracterización registrada correctamente',
-          hogar: { id: hogar.idHogar, codigo: hogar.codigoHogar },
-          familia: { id: familia.idFamilia, codigo: familia.codigoFamilia },
-          resumen: {
-            personas: personas.length,
-            afectaciones: afectaciones.length,
-            necesidades: necesidades.length,
-          },
-          idsPersonas: personas.map((p) => p.idPersona),
-          idsAfectaciones: afectaciones.map((a) => a.idAfectacion),
-          idsNecesidades: necesidades.map((n) => n.idNecesidad),
-        };
-      });
-    } catch (error) {
-      this.logger.error('Error al registrar la caracterización', error);
-      throw new InternalServerErrorException(
-        'No fue posible registrar la caracterización',
-      );
-    }
+  /** Borra lo guardado de la ficha en esa tabla e inserta las filas nuevas (cada paso se guarda completo). */
+  private async reemplazar<T>(m: EntityManager, entidad: Clase<T>, idFicha: number, filas: object[], borrar = true) {
+    if (borrar) await m.delete(entidad as never, { idFicha });
+    if (filas.length) await m.insert(entidad as never, filas.map((f) => ({ ...this.sinNulos(f), idFicha })) as Fila[]);
   }
 }
+
