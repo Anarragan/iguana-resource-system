@@ -17,10 +17,13 @@ import { DataSource } from 'typeorm';
         url: config.getOrThrow<string>('DATABASE_URL'),
         synchronize: false,
         autoLoadEntities: true,
-        logging: ['error', 'warn'],
-        ssl: {
-          rejectUnauthorized: false,
-        },
+        // Sin 'error': TypeORM registraría la consulta fallida CON sus parámetros (nombres, direcciones, teléfonos).
+        logging: ['warn'],
+        // DATABASE_SSL=disable solo para una base local; DATABASE_SSL_STRICT=true valida el certificado del servidor.
+        ssl:
+          config.get('DATABASE_SSL') === 'disable'
+            ? false
+            : { rejectUnauthorized: config.get('DATABASE_SSL_STRICT') === 'true' },
         extra: {
           max: 3,
           connectionTimeoutMillis: 10000,

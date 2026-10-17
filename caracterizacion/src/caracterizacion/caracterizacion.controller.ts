@@ -5,101 +5,95 @@ import {
   HttpCode,
   HttpStatus,
   Param,
-  ParseIntPipe,
+  ParseUUIDPipe,
   Post,
   Put,
   Query,
 } from '@nestjs/common';
+import { Public } from '../seguridad/publica.js';
 import { CaracterizacionService } from './caracterizacion.service.js';
-import { ListarCaracterizacionesDto } from './dto/listar-caracterizaciones.dto.js';
 import {
   AtencionDto,
-  CrearFichaDto,
-  DanosDto,
-  EscolaridadDto,
-  GruposDto,
+  ComposicionDto,
+  ContactoDto,
+  CrearHogarDto,
+  ListarHogaresDto,
   NecesidadesDto,
-  RespondenteDto,
-  SituacionDto,
-  VisitantesDto,
-} from './dto/crear-caracterizacion.dto.js';
-import { Escolaridad, Respondente, Situacion } from '../domain/entities/secciones.js';
+  ViviendaDto,
+} from './dto/hogar.dto.js';
 
-const Id = () => Param('id', ParseIntPipe);
+const Ref = () => Param('ref', new ParseUUIDPipe());
 
+/**
+ * API de los voluntarios: solo recolecta. Escribe datos y devuelve avance (qué pasos van, qué falta, alertas),
+ * pero NO existe ningún endpoint que devuelva nombres, direcciones, teléfonos ni las respuestas de una familia.
+ * Eso se consulta en la base de datos (vistas v_cola_entrega, v_demanda_ayuda, v_totales_sector…).
+ */
 @Controller()
 export class CaracterizacionController {
   constructor(private readonly servicio: CaracterizacionService) {}
 
-  /** Las 6 listas del formulario. */
+  @Public()
+  @Get('salud')
+  salud() {
+    return { estado: 'ok' };
+  }
+
+  /** Opciones y etiquetas de todas las preguntas. */
   @Get('catalogos')
   catalogos() {
     return this.servicio.catalogos();
   }
 
-  @Get('fichas')
-  listar(@Query() q: ListarCaracterizacionesDto) {
-    return this.servicio.listar(q.limite ?? 100, q.desde ?? 0);
+  /** Avance de los hogares (sin datos personales). */
+  @Get('hogares')
+  listar(@Query() q: ListarHogaresDto) {
+    return this.servicio.listar(q);
   }
 
-  /** Crea la ficha en borrador. */
-  @Post('fichas')
+  /** Momento cero: consentimiento + contacto. Devuelve `ref` (para las demás rutas) y `codigo` (para decirlo en voz alta). */
+  @Post('hogares')
   @HttpCode(HttpStatus.CREATED)
-  crear(@Body() dto: CrearFichaDto) {
+  crear(@Body() dto: CrearHogarDto) {
     return this.servicio.crear(dto);
   }
 
-  /** Ficha completa, anidada. */
-  @Get('fichas/:id')
-  obtener(@Id() id: number) {
-    return this.servicio.obtener(id);
+  /** Dónde va la ficha, qué falta para completarla y las alertas calculadas. */
+  @Get('hogares/:ref/progreso')
+  progreso(@Ref() ref: string) {
+    return this.servicio.obtenerProgreso(ref);
   }
 
-  // ---- Un PUT por paso del asistente ----
-  @Put('fichas/:id/respondente')
-  respondente(@Id() id: number, @Body() dto: RespondenteDto) {
-    return this.servicio.guardarUno(id, Respondente, dto);
+  // ---- Un PUT por paso del asistente; cada uno reemplaza su paso completo ----
+  @Put('hogares/:ref/contacto')
+  contacto(@Ref() ref: string, @Body() dto: ContactoDto) {
+    return this.servicio.guardarContacto(ref, dto);
   }
 
-  @Put('fichas/:id/escolaridad')
-  escolaridad(@Id() id: number, @Body() dto: EscolaridadDto) {
-    return this.servicio.guardarUno(id, Escolaridad, dto);
+  @Put('hogares/:ref/composicion')
+  composicion(@Ref() ref: string, @Body() dto: ComposicionDto) {
+    return this.servicio.guardarSeccion(ref, 'composicion', dto);
   }
 
-  @Put('fichas/:id/situacion')
-  situacion(@Id() id: number, @Body() dto: SituacionDto) {
-    return this.servicio.guardarUno(id, Situacion, dto);
+  @Put('hogares/:ref/vivienda')
+  vivienda(@Ref() ref: string, @Body() dto: ViviendaDto) {
+    return this.servicio.guardarSeccion(ref, 'vivienda', dto);
   }
 
-  @Put('fichas/:id/atencion')
-  atencion(@Id() id: number, @Body() dto: AtencionDto) {
-    return this.servicio.guardarAtencion(id, dto);
+  @Put('hogares/:ref/necesidades')
+  necesidades(@Ref() ref: string, @Body() dto: NecesidadesDto) {
+    return this.servicio.guardarSeccion(ref, 'necesidades', dto);
   }
 
-  @Put('fichas/:id/danos')
-  danos(@Id() id: number, @Body() dto: DanosDto) {
-    return this.servicio.guardarDanos(id, dto);
+  @Put('hogares/:ref/atencion')
+  atencion(@Ref() ref: string, @Body() dto: AtencionDto) {
+    return this.servicio.guardarSeccion(ref, 'atencion', dto);
   }
 
-  @Put('fichas/:id/necesidades')
-  necesidades(@Id() id: number, @Body() dto: NecesidadesDto) {
-    return this.servicio.guardarNecesidades(id, dto);
-  }
-
-  @Put('fichas/:id/visitantes')
-  visitantes(@Id() id: number, @Body() dto: VisitantesDto) {
-    return this.servicio.guardarVisitantes(id, dto);
-  }
-
-  @Put('fichas/:id/grupos')
-  grupos(@Id() id: number, @Body() dto: GruposDto) {
-    return this.servicio.guardarGrupos(id, dto);
-  }
-
-  /** Valida y pasa la ficha a 'completa'. */
-  @Post('fichas/:id/completar')
+  /** Cierra la ficha; si falta algo responde 400 con la lista. */
+  @Post('hogares/:ref/completar')
   @HttpCode(HttpStatus.OK)
-  completar(@Id() id: number) {
-    return this.servicio.completar(id);
+  completar(@Ref() ref: string) {
+    return this.servicio.completar(ref);
   }
 }
